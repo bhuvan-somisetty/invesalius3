@@ -1,8 +1,16 @@
 import numpy as np
 import pytest
 from scipy.ndimage import shift
+from vtkmodules.util.numpy_support import numpy_to_vtk
+from vtkmodules.vtkCommonCore import vtkPoints
+from vtkmodules.vtkCommonDataModel import vtkPolyData
 
-from invesalius.data.nonrigid_registration import demons_registration, warp_image
+from invesalius.data.nonrigid_registration import (
+    demons_registration,
+    warp_image,
+    warp_points,
+    warp_polydata,
+)
 
 
 def _make_sphere_volume(shape=(30, 30, 30), radius=8, center=None):
@@ -84,3 +92,65 @@ def test_demons_registration_returns_field_shaped_for_moving():
 
     assert displacement_field.shape == fixed.shape + (3,)
     assert warped.shape == fixed.shape
+
+
+def _make_polydata(points):
+    polydata = vtkPolyData()
+    vtk_points = vtkPoints()
+    vtk_points.SetData(numpy_to_vtk(np.asarray(points, dtype=np.float64), deep=True))
+    polydata.SetPoints(vtk_points)
+    return polydata
+
+
+def test_warp_points_zero_displacement_is_identity_in_world_space():
+    affine = np.eye(4)
+    affine[:3, 3] = (10.0, -5.0, 2.0)  # world origin offset only
+    displacement_field = np.zeros((10, 10, 10, 3))
+    points = np.array([[10.0, -5.0, 2.0], [12.0, -3.0, 5.0]])
+
+    warped = warp_points(points, displacement_field, affine)
+
+    assert np.allclose(warped, points)
+
+
+def test_warp_points_applies_spacing_scaled_displacement():
+    spacing = (2.0, 1.0, 0.5)
+    affine = np.diag((*spacing, 1.0))
+    displacement_field = np.zeros((10, 10, 10, 3))
+    displacement_field[..., 0] = 1.0  # 1 voxel along axis 0
+
+    point = np.array([[4.0, 4.0, 4.0]])  # voxel index (2, 4, 8)
+    warped = warp_points(point, displacement_field, affine)
+
+    # a 1-voxel displacement along axis 0 is `spacing[0]` mm in world space
+    assert np.allclose(warped, point + np.array([[spacing[0], 0.0, 0.0]]))
+
+
+def test_warp_points_rejects_wrong_shapes():
+    displacement_field = np.zeros((5, 5, 5, 3))
+    affine = np.eye(4)
+
+    with pytest.raises(ValueError):
+        warp_points(np.zeros((4,)), displacement_field, affine)
+    with pytest.raises(ValueError):
+        warp_points(np.zeros((3, 3)), np.zeros((5, 5, 5)), affine)
+    with pytest.raises(ValueError):
+        warp_points(np.zeros((3, 3)), displacement_field, np.eye(3))
+
+
+def test_warp_polydata_preserves_topology_and_warps_points():
+    affine = np.eye(4)
+    displacement_field = np.zeros((10, 10, 10, 3))
+    displacement_field[..., 2] = 3.0
+    points = np.array([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [3.0, 1.0, 1.0]])
+    polydata = _make_polydata(points)
+
+    warped_polydata = warp_polydata(polydata, displacement_field, affine)
+
+    assert warped_polydata.GetNumberOfPoints() == polydata.GetNumberOfPoints()
+    for i in range(3):
+        warped_point = np.array(warped_polydata.GetPoint(i))
+        assert np.allclose(warped_point, points[i] + np.array([0.0, 0.0, 3.0]))
+    # original polydata is untouched
+    for i in range(3):
+        assert np.allclose(np.array(polydata.GetPoint(i)), points[i])

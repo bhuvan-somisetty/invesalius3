@@ -31,10 +31,25 @@ Only numpy/scipy are used, both already project dependencies, so this
 does not introduce a new dependency (see discussion on issue #1433 about
 SimpleITK/Elastix). This module implements the registration backend only;
 it is not yet wired into any UI panel or navigation workflow.
+
+The demons iteration itself is run in voxel-index space, since that is
+what the intensity gradients and the update rule are defined on. But a
+displacement field expressed in voxel indices cannot, by itself, be
+applied to anything that lives in physical/world space, most notably a
+vtkPolyData surface, without also knowing the image's spacing, origin
+and axis orientation. This module represents that mapping the same way
+the rest of InVesalius does, as a 4x4 voxel-to-world affine (see
+invesalius.data.imagedata_utils.convert_world_to_voxel), and provides
+warp_points/warp_polydata to correctly resample the field at arbitrary
+world-space points and turn the interpolated voxel-space displacement
+into a world-space one.
 """
 
 import numpy as np
 from scipy.ndimage import gaussian_filter, map_coordinates
+from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
+from vtkmodules.vtkCommonCore import vtkPoints
+from vtkmodules.vtkCommonDataModel import vtkPolyData
 
 
 def warp_image(image: np.ndarray, displacement_field: np.ndarray, order: int = 1) -> np.ndarray:
@@ -157,3 +172,113 @@ def demons_registration(
         warped_moving = warp_image(moving, displacement_field)
 
     return displacement_field, warped_moving
+
+
+def warp_points(
+    points: np.ndarray, displacement_field: np.ndarray, affine: np.ndarray
+) -> np.ndarray:
+    """
+    Applies a voxel-space displacement field to points given in world
+    (physical, mm) coordinates.
+
+    `displacement_field` is defined on the voxel grid, one displacement
+    vector per voxel index, in voxel-index units (as returned by
+    `demons_registration`). `points`, however, are not guaranteed to land
+    on that grid, for instance the vertices of a vtkPolyData surface, so
+    the field is resampled at each point's voxel-space location by
+    trilinear interpolation rather than looked up directly.
+
+    The affine's linear part (its top-left 3x3) is what maps a voxel
+    displacement vector to a world displacement vector, since spacing and
+    axis orientation can make a step of, say, 1 along a voxel axis
+    correspond to a different length and/or direction in world space.
+    This mirrors invesalius.data.imagedata_utils.convert_world_to_voxel,
+    which uses the same affine to map points the other way.
+
+    Parameters
+    ----------
+    points : ndarray
+        Array of shape (N, 3) with world-space (x, y, z) coordinates.
+    displacement_field : ndarray
+        Array of shape ``fixed.shape + (3,)``, as returned by
+        `demons_registration`, giving the voxel-space displacement at
+        every voxel index (k, j, i) of the fixed volume.
+    affine : ndarray
+        4x4 voxel-to-world affine transform of the fixed volume (maps
+        (i, j, k) voxel indices to (x, y, z) world coordinates).
+
+    Returns
+    -------
+    ndarray
+        Array of shape (N, 3), the input points warped into world space.
+    """
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points must have shape (N, 3), got {points.shape}")
+    if displacement_field.ndim != 4 or displacement_field.shape[-1] != 3:
+        raise ValueError(
+            f"displacement_field must have shape (Z, Y, X, 3), got {displacement_field.shape}"
+        )
+    if affine.shape != (4, 4):
+        raise ValueError(f"affine must be a 4x4 matrix, got {affine.shape}")
+
+    inverse_affine = np.linalg.inv(affine)
+    points_homogeneous = np.hstack([points, np.ones((points.shape[0], 1))])
+    # voxel_coords[:, n] indexes displacement_field's axis n, matching the
+    # affine convention used throughout invesalius.data.imagedata_utils,
+    # where the affine maps voxel indices (i, j, k) to world (x, y, z)
+    # axis-for-axis, with no reversal between the two.
+    voxel_coords = (inverse_affine @ points_homogeneous.T).T[:, :3]
+
+    sample_coords = voxel_coords.T
+    voxel_displacement = np.stack(
+        [
+            map_coordinates(displacement_field[..., axis], sample_coords, order=1, mode="nearest")
+            for axis in range(3)
+        ],
+        axis=-1,
+    )
+
+    world_displacement = (affine[:3, :3] @ voxel_displacement.T).T
+
+    return points + world_displacement
+
+
+def warp_polydata(
+    polydata: vtkPolyData, displacement_field: np.ndarray, affine: np.ndarray
+) -> vtkPolyData:
+    """
+    Applies a voxel-space displacement field to a vtkPolyData surface.
+
+    Points are read out of `polydata`, warped in world space with
+    `warp_points`, and written into a new vtkPolyData that otherwise
+    shares `polydata`'s topology (points, polys/lines/verts, and point
+    data are deep-copied so the input is left untouched).
+
+    Parameters
+    ----------
+    polydata : vtkPolyData
+        Surface whose points are in the same world/physical space as the
+        volumes passed to `demons_registration`.
+    displacement_field : ndarray
+        Array of shape ``fixed.shape + (3,)``, as returned by
+        `demons_registration`.
+    affine : ndarray
+        4x4 voxel-to-world affine transform of the fixed volume.
+
+    Returns
+    -------
+    vtkPolyData
+        A new vtkPolyData with the same topology as `polydata` and its
+        points warped by the displacement field.
+    """
+    points = vtk_to_numpy(polydata.GetPoints().GetData())
+    warped_points = warp_points(points, displacement_field, affine)
+
+    warped_polydata = vtkPolyData()
+    warped_polydata.DeepCopy(polydata)
+
+    vtk_points = vtkPoints()
+    vtk_points.SetData(numpy_to_vtk(warped_points, deep=True))
+    warped_polydata.SetPoints(vtk_points)
+
+    return warped_polydata
